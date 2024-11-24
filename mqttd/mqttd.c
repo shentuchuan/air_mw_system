@@ -53,48 +53,18 @@
 #include "lwip/apps/mqtt_priv.h"
 #include "lwip/dns.h"
 #include "lwip/netif.h"
+#include "mbedtls/md5.h"
 #include "osapi.h"
 #include "osapi_timer.h"
 #include "osapi_thread.h"
 #include "osapi_string.h"
 #include "osapi_mutex.h"
 #include "db_api.h"
+#include "db_data.h"
 #include "inet_utils.h"
 #include "web.h"
+#include "hr_cjson.h"
 
-#if LWIP_ALTCP && LWIP_ALTCP_TLS
-#include "lwip/altcp_tls.h"
-#include "mbedtls/certs.h"
-/* enable MQTT over TLS. */
-#define MQTTD_SUPPORT_TLS    (1)
-/* change Your CA here. */
-#define CRLF "\r\n"
-static unsigned char CA[] =
-"-----BEGIN CERTIFICATE-----"CRLF
-"MIIDnzCCAocCFGkd1/mFlQh3AHgwdy7SI48OLEP+MA0GCSqGSIb3DQEBCwUAMIGN"CRLF
-"MSEwHwYJKoZIhvcNAQkBFhJkYXZlLmhlQGFpcm9oYS5jb20xCzAJBgNVBAYTAlRX"CRLF
-"MQ8wDQYDVQQIDAZUYWl3YW4xEDAOBgNVBAcMB0hzaW5jaHUxDzANBgNVBAoMBkFp"CRLF
-"cm9oYTEOMAwGA1UECwwFRU5CQ0ExFzAVBgNVBAMMDjE3Mi4yNC4xNTcuMTA4MB4X"CRLF
-"DTIzMDIxNzA4MTYwM1oXDTI0MDIxMjA4MTYwM1owgYkxIjAgBgkqhkiG9w0BCQEW"CRLF
-"E3J5bm4ueWVoQGFpcm9oYS5jb20xCzAJBgNVBAYTAlRXMQ8wDQYDVQQIDAZUYWl3"CRLF
-"YW4xDzANBgNVBAcMBlRhaXBlaTEPMA0GA1UECgwGQWlyb2hhMRIwEAYDVQQLDAlF"CRLF
-"TkJDbGllbnQxDzANBgNVBAMMBkVOODg1MTCCASIwDQYJKoZIhvcNAQEBBQADggEP"CRLF
-"ADCCAQoCggEBANlY/W6HifZtkpF4ZH5wvzHeNa5+GM1rE31WKUtOMU3le7kuNpU2"CRLF
-"GBOAZqC+WHWeNus3FsGOPn9eIqBsWrP4/5wKWCFkzm6MV90H4obHNJrzymqbH/qI"CRLF
-"/9JCSw3bN+BVC59yg27oV1QGyphjFujZD7G6CTMuNlwnIAkQwGoRRUV6Yxxwdni5"CRLF
-"jSLK2/07+hdaDglrqcVUNvvZjn7bSz/UXO/YodZT5Jp4Bh1an85/28fv0TAFw+f9"CRLF
-"7L6kAI96KjFaOT7LJGho6CXXv0ldMY61DTIGZGTboIrE6tlYlnXPBH1AnL2ZawjY"CRLF
-"I2ZxWhGX6G4kJYdccXnEUUTmdEs78JzhUtkCAwEAATANBgkqhkiG9w0BAQsFAAOC"CRLF
-"AQEAt6GgkcPGTnT76ARJUL9UXjL7KkwR0g24sjgJ4H3z2OPREE8llpVYpdL1d90x"CRLF
-"RoPBuHPrQQPDE6wlajwe9iTmR0mN3ZM915PmKIo2uqkt7R0NKsvGEsKOabpqbfUH"CRLF
-"eQplrjG9PWIy4rorK8X01LYJPiS2IelfDyqfqXmAKb9MID7gUQSgPm1gu8P7Fr5j"CRLF
-"/8HE2X+SX8XnwqG4giWwlVh5mr2KWhkVOtS9+aC/UQpEnvcDkztXK0GB+pILbu78"CRLF
-"1ip7Kq5g+wtaDde57a7HnEBGEdvnMCUUC7PUSsE/4FfIEFbYgC0BOkWEG2gBBHWs"CRLF
-"I3DFmUFKq47Or9gWBlpzOA7qyg=="CRLF
-"-----END CERTIFICATE-----"CRLF;
-#else
-#define MQTTD_SUPPORT_TLS    (0)
-#endif
 
 /* NAMING CONSTANT DECLARATIONS
 */
@@ -105,7 +75,8 @@ static unsigned char CA[] =
 #define MQTTD_TIMER_NAME            "mqttdTmr"
 #define MQTTD_STACK_SIZE            (808)
 #define MQTTD_THREAD_PRI            (4)
-#define MQTTD_MAX_TOPIC_SIZE        (44)   // Topic MAX Length 42 + tail end
+#define MQTTD_MAX_TOPIC_SIZE        (64)
+
 #define MQTTD_TIMER_PERIOD          (500)
 #define MQTTD_MUX_LOCK_TIME         (50)
 #define MQTTD_MAX_REMAIN_MSG        (64)
@@ -115,48 +86,59 @@ static unsigned char CA[] =
 
 /* MQTTD Client ID
 */
-#define MQTTD_MAX_CLIENT_ID_SIZE     (24)
-#define MQTTD_CLIENT_ID_FMT          "AIR%s%s"
-#define MQTTD_CLIENT_ID_PRODUCT_DFT  "EN8851"
+#define MQTTD_MAX_CLIENT_ID_SIZE     	(64)
+#define MQTTD_MAX_TOPIC_PREFIX_SIZE    	(64)
+#define MQTTD_MAX_SN_SIZE     			(17)
+#define MQTTD_MAX_MAC_SIZE     			(19)
+#define MQTTD_MAX_DEVICE_ID_SIZE     	(33)
+
+
+
 #define MQTTD_CLIENT_CONNECT_MSG_FMT "{\"port_num\":%2d, \"msg_ver\":\"%s\"}"
 #define MQTTD_MSG_VER                "2.0"
+#define MQTTD_IPV4_STR_SIZE 		(16)
+
+#define MQTTD_RC4_ENABLE 			(0)
+
 
 /* MQTTD Server Login
 */
-//const ip_addr_t mqttd_server_ip = IPADDR4_INIT_BYTES(122, 116, 233, 146);  // for OA domain
-const ip_addr_t mqttd_server_ip = IPADDR4_INIT_BYTES(54, 87, 224, 92);  // for AWS domain
-#if LWIP_DNS
-const C8_T cloud_hostname[] = "cloudmw.airoha.com";
-#endif
+//const ip_addr_t mqttd_server_ip = IPADDR4_INIT_BYTES(47, 237, 80, 17);  // for ikuai domain
+const ip_addr_t mqttd_server_ip = IPADDR4_INIT_BYTES(192, 168, 0, 100);  // for ikuai domain
 
-#define MQTTD_USERNAME              "mw-client"
-#define MQTTD_PASSWD                "magicwand"
+#if LWIP_DNS
+const C8_T cloud_hostname[] = "swmgr.hruicloud.com";
+#endif
+#define MQTT_SRV_PORT			    (10883)
+#define MQTTD_USERNAME              "ik_test"
+#define MQTTD_PASSWD                "eiChaes7"
 #define MQTTD_KEEP_ALIVE            (5)
+#define MQTTD_RC4_KEY               "sqMVh5qAnHpLeMeM"
 
 /* MQTTD Topics
 */
-#define MQTTD_TOPIC_PREFIX          "mw"
-#define MQTTD_TOPIC_CLOUD_PREFIX    "cmw"
+#define MQTTD_TOPIC_PREFIX          "hongrui"
+#define MQTTD_TOPIC_CLOUD_PREFIX    "hongrui/sw"
 //Will message
-#define MQTTD_WILL_TOPIC            MQTTD_TOPIC_PREFIX "/will"
+//#define MQTTD_WILL_TOPIC            MQTTD_TOPIC_PREFIX "/will"
 #define MQTTD_WILL_QOS              (2)
 #define MQTTD_WILL_RETAIN           (1)
 //Normal message
-#define MQTTD_TOPIC_NEW             MQTTD_TOPIC_PREFIX "/new"
-#define MQTTD_TOPIC_DB              MQTTD_TOPIC_PREFIX "/db"
-#define MQTTD_TOPIC_INIT            MQTTD_TOPIC_DB "/init"
-#define MQTTD_TOPIC_DBRC            MQTTD_TOPIC_DB "/rc"
+//#define MQTTD_TOPIC_NEW             MQTTD_TOPIC_PREFIX "/new"
+//#define MQTTD_TOPIC_DB              MQTTD_TOPIC_PREFIX "/db"
+//#define MQTTD_TOPIC_INIT            MQTTD_TOPIC_DB "/init"
+//#define MQTTD_TOPIC_DBRC            MQTTD_TOPIC_DB "/rc"
 #define MQTTD_REQUEST_QOS           (0)
 #define MQTTD_REQUEST_RETAIN        (0)
 //Cloud message
-#define MQTTD_CLOUD_TODB            "mwcloud/db"
-#define MQTTD_SUB_CLOUD_FILTER      MQTTD_TOPIC_CLOUD_PREFIX "/#"
-#define MQTTD_CLOUD_CONNECTED       MQTTD_TOPIC_CLOUD_PREFIX "/connected"
-#define MQTTD_CLOUD_WILL            MQTTD_TOPIC_CLOUD_PREFIX "/will"
-#define MQTTD_CLOUD_CGI             MQTTD_TOPIC_CLOUD_PREFIX "/cgi"
+//#define MQTTD_CLOUD_TODB            "mwcloud/db"
+//#define MQTTD_SUB_CLOUD_FILTER      MQTTD_TOPIC_CLOUD_PREFIX "/#"
+//#define MQTTD_CLOUD_CONNECTED       MQTTD_TOPIC_CLOUD_PREFIX "/connected"
+//#define MQTTD_CLOUD_WILL            MQTTD_TOPIC_CLOUD_PREFIX "/will"
+//#define MQTTD_CLOUD_CGI             MQTTD_TOPIC_CLOUD_PREFIX "/cgi"
 //Normal Publish Topic format
 /* <msg topic>/<cldb_ID>/<table_name>/<field_name>/eidx */
-#define MQTTD_TOPIC_FORMAT          "%s/%hu/%s/%s/%hu"
+//#define MQTTD_TOPIC_FORMAT          "%s/%hu/%s/%s/%hu"
 
 /* MQTTD Publish Application message
 */
@@ -164,6 +146,23 @@ const C8_T cloud_hostname[] = "cloudmw.airoha.com";
 #define MQTTD_MAX_PACKET_SIZE       (MQTTD_MQX_OUTPUT_SIZE - 2 - 7)   /* MAX size of topic + payload, exclude the fix header and length */
 #define MQTTD_MSG_HEADER_SIZE       (sizeof(MQTTD_PUB_MSG_T) - DB_MSG_PTR_SIZE)     /* size of message header and length in PUBLISH payload */
 #define MQTTD_MAX_SESSION_ID        (255)
+
+
+typedef enum {
+    MQTTD_TX_CAPABILITY = 0,
+    MQTTD_TX_RULES = 1,
+    MQTTD_TX_GETCONFIG = 2,
+    MQTTD_TX_SETCONFIG = 3,
+    MQTTD_TX_RESET = 4,
+    MQTTD_TX_REBOOT = 5,
+    MQTTD_TX_REBOOTPORT = 6,
+    MQTTD_TX_CHECK = 7,
+    MQTTD_TX_TUNNEL = 8,
+    MQTTD_TX_UPDATE = 9,
+    MQTTD_TX_LOGS = 10,
+    MQTTD_TX_BIND = 11,
+    MQTTD_TX_MAX = 12,
+}MQTTD_TX_TYPE;
 /* MACRO FUNCTION DECLARATIONS
  */
 
@@ -224,8 +223,13 @@ typedef struct MQTTD_CTRL_S
 {
     MQTTD_STATE_T   state;
     ip_addr_t       server_ip;
+	UI16_T			port;
     UI16_T          cldb_id;        /* The switch identifier in cloud DB */
-    C8_T            client_id[MQTTD_MAX_CLIENT_ID_SIZE];
+    C8_T            client_id[MQTTD_MAX_CLIENT_ID_SIZE];	/*{manufacturer}:sw:{deviceid}*/
+	C8_T            topic_prefix[MQTTD_MAX_TOPIC_PREFIX_SIZE];	/*{manufacturer}/sw/{deviceid}*/
+	C8_T			sn[MQTTD_MAX_SN_SIZE];
+	C8_T			mac[MQTTD_MAX_MAC_SIZE];
+	C8_T			device_id[MQTTD_MAX_DEVICE_ID_SIZE];
     mqtt_client_t*  ptr_client;
     UI8_T           db_subscribed;
     UI8_T           reconnect;
@@ -238,9 +242,7 @@ typedef struct MQTTD_CTRL_S
 */
 UI8_T mqttd_enable;
 MQTTD_CTRL_T mqttd;
-#if MQTTD_SUPPORT_TLS
-struct altcp_tls_config *tls_config = NULL;
-#endif
+
 /* LOCAL SUBPROGRAM SPECIFICATIONS
 */
 static void _mqttd_ctrl_init(MQTTD_CTRL_T *ptr_mqttd, ip_addr_t *server_ip);
@@ -249,14 +251,14 @@ static MW_ERROR_NO_T _mqttd_append_remain_msg(MQTTD_CTRL_T *ptr_mqttd, C8_T *top
 static void _mqttd_send_remain_msg(MQTTD_CTRL_T *ptr_mqttd);
 static void _mqttd_tmr(timehandle_t ptr_xTimer);
 /*=== DB related local functions ===*/
-static UI8_T _mqttd_gen_client_id(MQTTD_CTRL_T *ptr_mqttd);
+static void _mqttd_gen_client_id(MQTTD_CTRL_T *ptr_mqttd);
 static MW_ERROR_NO_T _mqttd_subscribe_db(MQTTD_CTRL_T *ptr_mqttd);
 static MW_ERROR_NO_T _mqttd_unsubscribe_db(MQTTD_CTRL_T *ptr_mqttd);
 static void _mqttd_listen_db(MQTTD_CTRL_T *ptr_mqttd);
 /*=== MQTT related local functions ===*/
 static void _mqttd_cgi_proxy(MQTTD_CTRL_T *ptr_mqttd, const u8_t *data, u16_t len);
 static void _mqttd_dataDump(const void *data, UI16_T data_size);
-static UI16_T _mqttd_db_topic_set(MQTTD_CTRL_T *ptr_mqttd, const UI8_T method, const UI8_T t_idx, const UI8_T f_idx, const UI16_T e_idx, C8_T *topic, UI16_T buf_size);
+//static UI16_T _mqttd_db_topic_set(MQTTD_CTRL_T *ptr_mqttd, const UI8_T method, const UI8_T t_idx, const UI8_T f_idx, const UI16_T e_idx, C8_T *topic, UI16_T buf_size);
 static void _mqttd_publish_cb(void *arg, err_t err);
 static MW_ERROR_NO_T _mqttd_publish_data(MQTTD_CTRL_T *ptr_mqttd, const UI8_T method, C8_T *topic, const UI16_T data_size, const void *ptr_data);
 static void _mqttd_incoming_publish_cb(void *arg, const char *topic, u32_t tot_len);
@@ -282,6 +284,95 @@ static threadhandle_t ptr_mqttdmain = NULL;
 static timehandle_t ptr_mqttd_time = NULL;
 static semaphorehandle_t ptr_mqttmutex = NULL;
 static timehandle_t ptr_mqttd_recon_time = NULL;
+
+void mqttd_rc4_encrypt(unsigned char *data, int data_len, const char *key, unsigned char *output) 
+{
+#if (MQTTD_RC4_ENABLE)
+    int i, j = 0, k;
+    unsigned char S[256];
+    unsigned char temp;
+
+    // Initialize the key-scheduling algorithm (KSA)
+    for (i = 0; i < 256; i++) {
+        S[i] = i;
+    }
+
+    for (i = 0; i < 256; i++) {
+        j = (j + S[i] + key[i % strlen(key)]) % 256;
+        temp = S[i];
+        S[i] = S[j];
+        S[j] = temp;
+    }
+
+    // Initialize the pseudo-random generation algorithm (PRGA)
+    i = 0;
+    j = 0;
+    for (k = 0; k < data_len; k++) {
+        i = (i + 1) % 256;
+        j = (j + S[i]) % 256;
+        temp = S[i];
+        S[i] = S[j];
+        S[j] = temp;
+        output[k] = data[k] ^ S[(S[i] + S[j]) % 256];
+    }
+#else
+    osapi_memcpy(output, data, data_len);
+#endif
+}
+
+#define mqttd_rc4_decrypt mqttd_rc4_encrypt
+
+
+#define MQTT_CHECK_COND(__shift__, __op__, __size__) do       \
+{                                                               \
+    if ((__shift__) __op__ (__size__))                          \
+    {                                                           \
+        ;                                                       \
+    }                                                           \
+    else                                                        \
+    {                                                           \
+        return (MW_E_BAD_PARAMETER);                           \
+    }                                                           \
+} while(0)
+
+
+MW_ERROR_NO_T
+mqttd_transStrToIpv4Addr(
+    const C8_T          *ptr_str,
+    MW_IPV4_T          *ptr_addr)
+{
+    UI32_T              value = 0, idx = 0, shift = 0;
+
+    osapi_memset(ptr_addr, 0, sizeof(MW_IPV4_T));
+
+    /* e.g. 192.168.1.2, token_len = 11 */
+    for (idx = 0; idx < osapi_strlen(ptr_str); idx++)
+    {
+        if (('0' <= ptr_str[idx]) && ('9' >= ptr_str[idx]))
+        {
+            value = (value * 10) + (ptr_str[idx] - '0');
+        }
+        else if ('.' == ptr_str[idx])
+        {
+            MQTT_CHECK_COND(value, <, 256); /* Error: invalid value */
+            MQTT_CHECK_COND(shift, <, 4);   /* Error: mem-overwrite */
+            *ptr_addr |= value << (24 - shift * 8);
+            shift += 1;
+            value = 0;
+        }
+        else
+        {
+            return (MW_E_BAD_PARAMETER); /* Error: not a digit number or dot */
+        }
+    }
+
+    /* last data */
+    MQTT_CHECK_COND(value, <, 256); /* Error: invalid value */
+    MQTT_CHECK_COND(shift, ==, 3);  /* Error: not an ipv4 addr */
+    *ptr_addr |= value << (24 - shift * 8);
+
+    return (MW_E_OK);
+}
 
 /* LOCAL SUBPROGRAM BODIES
  */
@@ -559,6 +650,8 @@ static void _mqttd_tmr(timehandle_t ptr_xTimer)
     }
 }
 /*=== DB related local functions ===*/
+
+#if 0
 /* FUNCTION NAME:  _mqttd_gen_client_id
  * PURPOSE:
  *      Get the hardware verion and MAC address of the device
@@ -620,7 +713,7 @@ static UI8_T _mqttd_gen_client_id(MQTTD_CTRL_T *ptr_mqttd)
     mqttd_debug("Create MQTTD client id: %s", ptr_mqttd->client_id);
     return osapi_strlen(ptr_mqttd->client_id);
 }
-
+#endif
 /* FUNCTION NAME:  _mqttd_subscribe_db
  * PURPOSE:
  *      Subscribe all internal DB tables
@@ -684,7 +777,7 @@ _mqttd_subscribe_db(
         osapi_free(ptr_msg);
         return rc;
     }
-    mqttd_debug_db("Subscribe DB success, db_msg =%p", ptr_msg);
+    osapi_printf("Subscribe DB success, db_msg =%p\n", ptr_msg);
     ptr_mqttd->db_subscribed = TRUE;
     return rc;
 }
@@ -753,6 +846,88 @@ _mqttd_unsubscribe_db(
     return rc;
 }
 
+/*publish sysinfo to mqtt cloud server with event topic*/
+static MW_ERROR_NO_T _mqttd_publish_sysinfo(MQTTD_CTRL_T *ptr_mqttd,  const DB_REQUEST_TYPE_T *req, const void *ptr_data)
+{
+	MW_ERROR_NO_T rc = MW_E_OK;
+    DB_MSG_T *db_msg = NULL;
+    UI16_T db_size = 0;
+    void *db_data = NULL;
+    DB_SYS_INFO_T *ptr_sys_info = NULL;
+	osapi_printf("publish sysinfo: T/F/E =%u/%u/%u\n", req->t_idx, req->f_idx, req->e_idx);
+	
+    rc = mqttd_queue_getData(SYS_INFO, DB_ALL_FIELDS, DB_ALL_ENTRIES, &db_msg, &db_size, &db_data);
+    if(MW_E_OK == rc)
+    {
+        /* If SUBACK received, then PUBLISH online event */
+        char topic[128];
+		C8_T ip_str[MQTTD_IPV4_STR_SIZE];
+        osapi_snprintf(topic, sizeof(topic), "%s/event", ptr_mqttd->topic_prefix);
+        ptr_sys_info = (DB_SYS_INFO_T *)db_data;
+        osapi_printf("sysinfo: db_size:%d\n", db_size);
+        cJSON *root = cJSON_CreateObject();
+        cJSON *data = cJSON_CreateObject();
+        cJSON *device = cJSON_CreateObject();
+        cJSON *ip = cJSON_CreateObject();
+        if (root == NULL || data == NULL || device == NULL || ip == NULL) {
+            mqttd_debug("Failed to create JSON objects\n");
+            if (root != NULL) cJSON_Delete(root);
+            if (data != NULL) cJSON_Delete(data);
+            if (device != NULL) cJSON_Delete(device);
+            if (ip != NULL) cJSON_Delete(ip);
+            return;
+        }
+
+	    cJSON_AddStringToObject(root, "type", "config");
+	    cJSON_AddItemToObject(root, "data", data);
+        cJSON_AddItemToObject(data, "device", device);
+	    cJSON_AddStringToObject(device, "n", ptr_sys_info->sys_name);
+        cJSON_AddItemToObject(data, "ip", ip);
+	    cJSON_AddBoolToObject(ip, "auip", ptr_sys_info->dhcp_enable);
+		
+		memset(ip_str, 0, MQTTD_IPV4_STR_SIZE);
+		MW_UTIL_IPV4_TO_STR(ip_str, PP_HTONL(ptr_sys_info->static_ip));
+	    cJSON_AddStringToObject(ip, "ip", ip_str);
+		
+		memset(ip_str, 0, MQTTD_IPV4_STR_SIZE);
+		MW_UTIL_IPV4_TO_STR(ip_str, PP_HTONL(ptr_sys_info->static_mask));
+	    cJSON_AddStringToObject(ip, "mask", ip_str);
+
+		memset(ip_str, 0, MQTTD_IPV4_STR_SIZE);
+		MW_UTIL_IPV4_TO_STR(ip_str, PP_HTONL(ptr_sys_info->static_gw));
+	    cJSON_AddStringToObject(ip, "gw", ip_str);
+		
+        cJSON_AddNumberToObject(ip, "aud", ptr_sys_info->autodns_enable);
+		
+		memset(ip_str, 0, MQTTD_IPV4_STR_SIZE);
+		MW_UTIL_IPV4_TO_STR(ip_str, PP_HTONL(ptr_sys_info->static_dns));
+	    cJSON_AddStringToObject(ip, "dns", ip_str);
+
+	    char *original_payload = cJSON_PrintUnformatted(root);
+	    cJSON_Delete(root);
+		osapi_free(db_msg);
+		
+		osapi_printf("sysinfo: payload:%s\n", original_payload);
+		
+	    if (original_payload == NULL) {
+	        osapi_printf("Failed to print JSON\n");
+            
+	        return;
+	    }
+
+		int original_payloadlen = strlen(original_payload);
+		unsigned char encoded_payload[512];
+		// Encrypt the payload using RC4
+    	mqttd_rc4_encrypt((unsigned char *)original_payload, original_payloadlen, MQTTD_RC4_KEY, encoded_payload);
+        mqtt_publish(ptr_mqttd->ptr_client, topic, (const void *)encoded_payload, original_payloadlen, MQTTD_REQUEST_QOS, MQTTD_REQUEST_RETAIN, _mqttd_publish_cb, (void *)ptr_mqttd);
+		free(original_payload); // Free the JSON payload
+        
+        osapi_printf("\nMQTT subscribe event topic with ip config done.\n");
+    }
+	return rc;
+}
+
+#if 0
 /* FUNCTION NAME:  _mqttd_listen_db
  * PURPOSE:
  *      Listen to DB's notification
@@ -842,6 +1017,101 @@ _mqttd_listen_db(
     ptr_msg = NULL;
 }
 
+#else
+/* FUNCTION NAME:  _mqttd_listen_db
+ * PURPOSE:
+ *      Listen to DB's notification
+ *
+ * INPUT:
+ *      ptr_mqttd    --  the pointer of MQTTD ctrl structure
+ *
+ * OUTPUT:
+ *      None
+ *
+ * RETURN:
+ *
+ * NOTES:
+ *      None
+ */
+static void
+_mqttd_listen_db(
+    MQTTD_CTRL_T *ptr_mqttd)
+{
+    MW_ERROR_NO_T rc = MW_E_OK;
+    C8_T topic[MQTTD_MAX_TOPIC_SIZE] = {0};
+    DB_MSG_T *ptr_msg = NULL;
+    UI8_T *ptr_data = NULL;
+    UI16_T msg_size = 0;
+    UI8_T count = 0;
+    UI8_T method = 0;
+    DB_REQUEST_TYPE_T req;
+
+    /* Block mode to receive the DB message */
+    rc = dbapi_recvMsg(
+            MQTTD_QUEUE_NAME,
+            &ptr_msg,
+            MQTTD_QUEUE_TIMEOUT);
+    if (MW_E_OK != rc)
+    {
+        return;
+    }
+
+    mqttd_debug_db("get ptr_msg =%p", ptr_msg);
+    if (M_B_RESPONSE == (ptr_msg->method & M_B_RESPONSE))
+    {
+        mqttd_debug_db("free the response meesage: ptr_msg =%p", ptr_msg);
+        osapi_free(ptr_msg);
+        return;
+    }
+
+    /* Send the updates to Cloud */
+    if (ptr_mqttd->ptr_client != NULL)
+    {
+        count = ptr_msg->type.count;
+        method = ptr_msg->method;
+        mqttd_debug_db("count =%d, method =%u", count, method);
+
+        if (M_UPDATE == method)
+        {
+            ptr_data = (UI8_T *)&(ptr_msg->ptr_payload);
+            while (count > 0)
+            {
+                memcpy((void *)&req, (const void *)ptr_data, sizeof(DB_REQUEST_TYPE_T));
+                ptr_data += sizeof(DB_REQUEST_TYPE_T);
+                mqttd_debug_db("T/F/E =%u/%u/%u", req.t_idx, req.f_idx, req.e_idx);
+                /* append db json data to PUBLISH request list */
+                memcpy((void *)&msg_size, (const void *)ptr_data, sizeof(UI16_T));
+                mqttd_debug_db("data size =%u", msg_size);
+                ptr_data += sizeof(UI16_T);
+                /* append db rawdata to PUBLISH request list */
+                switch (req.t_idx)  /*TABLES_T*/
+                {
+                    case SYS_INFO:
+						(void)_mqttd_publish_sysinfo(ptr_mqttd, &req, ptr_data);
+                        break;
+                    case ACCOUNT_INFO:
+                        break;
+                    case PORT_CFG_INFO:
+                        break;
+                    case LOGON_INFO:
+                        break;
+                    case PORT_MIRROR_INFO:
+                        break;
+                    default:
+                        mqttd_debug_db("Invalid TABLES_T value: %u", req.t_idx);
+                        break;
+                }
+                count--;
+                ptr_data += msg_size;
+            }
+        }
+    }
+    mqttd_debug_db("free ptr_msg =%p\n", ptr_msg);
+    osapi_free(ptr_msg);
+    ptr_msg = NULL;
+}
+
+#endif
 /* FUNCTION NAME:  _mqttd_db_proxy
  * PURPOSE:
  *      Proxy the mqtt request to internal DB
@@ -1145,6 +1415,7 @@ static void _mqttd_dataDump(const void *data, UI16_T data_size)
     }
 }
 
+#if 0
 /* FUNCTION NAME: _mqttd_db_topic_set
  * PURPOSE:
  *      Set the DB notification to MQTT message topic
@@ -1207,6 +1478,7 @@ static UI16_T _mqttd_db_topic_set(MQTTD_CTRL_T *ptr_mqttd, const UI8_T method, c
     return (UI16_T)(length & 0xFFFF);
 }
 
+#endif
 /* FUNCTION NAME: _mqttd_publish_cb
  * PURPOSE:
  *      MQTTD publish callback function
@@ -1223,7 +1495,9 @@ static UI16_T _mqttd_db_topic_set(MQTTD_CTRL_T *ptr_mqttd, const UI8_T method, c
  */
 static void _mqttd_publish_cb(void *arg, err_t err)
 {
+	MQTTD_CTRL_T *ptr_mqttd = (MQTTD_CTRL_T *)arg;
     mqttd_debug("Send Publish control packet code: (%d).\n", err);
+	
 }
 
 /* FUNCTION NAME: _mqttd_publish_data
@@ -1388,6 +1662,121 @@ static void _mqttd_incoming_publish_cb(void *arg, const char *topic, u32_t tot_l
     osapi_strncpy(ptr_mqttd->pub_in_topic, topic, (MQTTD_MAX_TOPIC_SIZE-1));
 }
 
+static MW_ERROR_NO_T _mqttd_handle_setconfig_ip(MQTTD_CTRL_T *mqttdctl, cJSON *data_obj)
+{
+    MW_ERROR_NO_T rc = MW_E_OK;
+    DB_SYS_INFO_T sys_info;
+    DB_MSG_T *ptr_db_msg = NULL;
+    u16_t db_size = 0;
+    void *db_data = NULL;
+    memset(&sys_info, 0, sizeof(DB_SYS_INFO_T));
+
+    rc = mqttd_queue_getData(SYS_INFO, DB_ALL_FIELDS, DB_ALL_ENTRIES, &ptr_db_msg, &db_size, &db_data);
+    if (MW_E_OK != rc) {
+        mqttd_debug("get org DB sys_info failed(%d)\n", rc);
+        return rc;
+    }
+
+    memcpy(&sys_info, db_data, sizeof(DB_SYS_INFO_T));
+    MW_FREE(ptr_db_msg);
+
+    cJSON *dhcp_obj = cJSON_GetObjectItemCaseSensitive(data_obj, "auip");
+    if (dhcp_obj) {
+        sys_info.dhcp_enable = dhcp_obj->valueint;
+    }
+
+    cJSON *autodns_obj = cJSON_GetObjectItemCaseSensitive(data_obj, "aud");
+    if (autodns_obj) {
+        sys_info.autodns_enable = autodns_obj->valueint;
+    }
+
+    cJSON *ip_obj = cJSON_GetObjectItemCaseSensitive(data_obj, "ip");
+    if (ip_obj) {
+        MW_IPV4_T new_ip;
+        rc = mqttd_transStrToIpv4Addr(ip_obj->valuestring, &new_ip);
+        if (MW_E_OK == rc) {
+            sys_info.static_ip = new_ip;
+        }
+    }
+
+    cJSON *mask_obj = cJSON_GetObjectItemCaseSensitive(data_obj, "mask");
+    if (mask_obj) {
+        MW_IPV4_T new_mask;
+        rc = mqttd_transStrToIpv4Addr(mask_obj->valuestring, &new_mask);
+        if (MW_E_OK == rc) {
+            sys_info.static_mask = new_mask;
+        }
+    }
+
+    cJSON *gw_obj = cJSON_GetObjectItemCaseSensitive(data_obj, "gw");
+    if (gw_obj) {
+        MW_IPV4_T new_gw;
+        rc = mqttd_transStrToIpv4Addr(gw_obj->valuestring, &new_gw);
+        if (MW_E_OK == rc) {
+            sys_info.static_gw = new_gw;
+        }
+    }
+
+    cJSON *dns_obj = cJSON_GetObjectItemCaseSensitive(data_obj, "dns");
+    if (dns_obj) {
+        MW_IPV4_T new_dns;
+        rc = mqttd_transStrToIpv4Addr(dns_obj->valuestring, &new_dns);
+        if (MW_E_OK == rc) {
+            sys_info.static_dns = new_dns;
+        }
+    }
+
+    rc = mqttd_queue_setData(M_UPDATE, SYS_INFO, DB_ALL_FIELDS, DB_ALL_ENTRIES, &sys_info, sizeof(sys_info));
+    if (MW_E_OK != rc) {
+        mqttd_debug("Update DB sys_info failed(%d)\n", rc);
+    }
+
+    return rc;
+}
+
+
+
+static MW_ERROR_NO_T _mqttd_handle_setconfig_data(MQTTD_CTRL_T *mqttdctl,  cJSON *data_obj)
+{
+    MW_ERROR_NO_T rc = MW_E_OK;
+    mqttd_debug("Handling setConfig type.");
+    mqttd_debug("data_obj: %s", cJSON_Print(data_obj));
+    cJSON *child = NULL;
+    cJSON_ArrayForEach(child, data_obj)
+    {
+        if (osapi_strcmp(child->string, "ip") == 0) {
+            rc = _mqttd_handle_setconfig_ip(mqttdctl, child);
+            if (MW_E_OK != rc) {
+                mqttd_debug("Handling setConfig ip failed.");
+				return rc;
+            }
+        } else if (osapi_strcmp(child->string, "loop_guard") == 0) {
+            // Handle "loop_guard" case
+        } else if (osapi_strcmp(child->string, "port_setting") == 0) {
+            // Handle "port_setting" case
+        } else if (osapi_strcmp(child->string, "port_mirroring") == 0) {
+            // Handle "port_mirroring" case
+        } else if (osapi_strcmp(child->string, "port_isolate") == 0) {
+            // Handle "port_isolate" case
+        } else if (osapi_strcmp(child->string, "static_mac") == 0) {
+            // Handle "static_mac" case
+        } else if (osapi_strcmp(child->string, "filter_mac") == 0) {
+            // Handle "filter_mac" case
+        } else if (osapi_strcmp(child->string, "vlan_member") == 0) {
+            // Handle "vlan_member" case
+        } else if (osapi_strcmp(child->string, "vlan_setting") == 0) {
+            // Handle "vlan_setting" case
+        } else if (osapi_strcmp(child->string, "port_limit_rate") == 0) {
+            // Handle "port_limit_rate" case
+        } else if (osapi_strcmp(child->string, "storm_control") == 0) {
+            // Handle "storm_control" case
+        } else if (osapi_strcmp(child->string, "poe_control") == 0) {
+            // Handle "poe_control" case
+        }
+    }
+	return rc;
+}
+#if 0
 /* FUNCTION NAME: _mqttd_incoming_data_cb
  * PURPOSE:
  *      MQTTD publish data payload callback function
@@ -1467,7 +1856,167 @@ static void _mqttd_incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t
      /* Do nothing */
     else {}
 }
+#else
+/* FUNCTION NAME: _mqttd_incoming_data_cb
+ * PURPOSE:
+ *      MQTTD publish data payload callback function
+ *
+ * INPUT:
+ *
+ * OUTPUT:
+ *      None
+ *
+ * RETURN:
+ *
+ * NOTES:
+ *
+ */
+static void _mqttd_incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t flags)
+{
+    MQTTD_CTRL_T *ptr_mqttd = (MQTTD_CTRL_T *)arg;
+    UI16_T idata = 0;
+    C8_T new_topic[MQTTD_MAX_TOPIC_SIZE] = {0};
+    osapi_snprintf(new_topic, MQTTD_MAX_TOPIC_SIZE, "%s/tx", ptr_mqttd->topic_prefix);
 
+    osapi_printf("Incoming data length: %d\n", len);
+
+    /* tx */
+    if (0 == osapi_strcmp(ptr_mqttd->pub_in_topic, new_topic))
+    {
+        mqttd_debug_pkt("Incoming data: %s", data);
+        // Allocate memory for decoded data
+        unsigned char *decoded_data = NULL;
+        if (osapi_malloc(len, MQTTD_TASK_NAME, &decoded_data) != MW_E_OK)
+        {
+            mqttd_debug("Failed to allocate memory for decoded data.");
+            return;
+        }
+
+        // Decode the data into the allocated memory
+        mqttd_rc4_decrypt((unsigned char *)data, len, MQTTD_RC4_KEY, decoded_data);
+
+        // Use the decoded data
+        mqttd_debug_pkt("Decoded data: %s", decoded_data);
+
+        // Parse the JSON data using cJSON
+        cJSON *json_obj = cJSON_Parse((const char *)decoded_data);
+        if (json_obj == NULL)
+        {
+            mqttd_debug("Failed to parse JSON data.");
+            osapi_free(decoded_data);
+            return;
+        }
+		MW_ERROR_NO_T rc = MW_E_OK;
+        // Check the type field in the JSON data
+        cJSON *type_obj = cJSON_GetObjectItemCaseSensitive(json_obj, "type");
+        cJSON *msgid_obj = cJSON_GetObjectItemCaseSensitive(json_obj, "msg_id");
+        cJSON *data_obj = cJSON_GetObjectItemCaseSensitive(json_obj, "data");
+        if ((cJSON_IsString(type_obj) && (type_obj->valuestring != NULL)) &&
+            (cJSON_IsString(msgid_obj) && (msgid_obj->valuestring != NULL)) &&
+            (cJSON_IsObject(data_obj) && (data_obj->child != NULL)))
+        {
+            const char *type_str = type_obj->valuestring;
+            const char *msgid_str = msgid_obj->valuestring;
+
+            mqttd_debug("Type in JSON data: %s", type_str);
+
+            // Handle different types
+            if (osapi_strcmp(type_str, "capability") == 0)
+            {
+                // Handle the desired type
+                mqttd_debug("Handling capability type.");
+            }
+            else if (osapi_strcmp(type_str, "rules") == 0)
+            {
+                mqttd_debug("Handling rules type.");
+            }
+            else if (osapi_strcmp(type_str, "getConfig") == 0)
+            {
+                mqttd_debug("Handling getConfig type.");
+            }
+            else if (osapi_strcmp(type_str, "setConfig") == 0)
+            {
+            	rc = _mqttd_handle_setconfig_data(ptr_mqttd, data_obj);
+				if(rc != MW_E_OK)
+				{
+					mqttd_debug("Handling setConfig type failed.");
+				}
+				else
+				{
+					mqttd_debug("Handling setConfig type done.");
+				}
+
+            }
+            else if (osapi_strcmp(type_str, "reset") == 0)
+            {
+                mqttd_debug("Handling reset type.");
+
+            }
+            else if (osapi_strcmp(type_str, "reboot") == 0)
+            {
+                mqttd_debug("Handling reboot type.");
+
+            }
+            else if (osapi_strcmp(type_str, "rebootPort") == 0)
+            {
+                mqttd_debug("Handling rebootPort type.");
+
+            }
+            else if (osapi_strcmp(type_str, "check") == 0)
+            {
+                mqttd_debug("Handling check type.");
+
+            }
+            else if (osapi_strcmp(type_str, "tunnel") == 0)
+            {
+                mqttd_debug("Handling tunnel type.");
+
+            }
+            else if (osapi_strcmp(type_str, "update") == 0)
+            {
+                mqttd_debug("Handling update type.");
+            }
+            else if (osapi_strcmp(type_str, "logs") == 0)
+            {
+                mqttd_debug("Handling logs type.");
+
+            }
+            else if (osapi_strcmp(type_str, "bind") == 0)
+            {
+                mqttd_debug("Handling bind type.");
+            }
+            else
+            {
+                mqttd_debug("Unhandled type: %s", type_str);
+            }
+
+        }
+        else
+        {
+            mqttd_debug("Type field not found in JSON data.");
+			rc = MW_E_NOT_SUPPORT;
+        }
+
+		//send reponse back
+
+		
+        // Clean up
+        cJSON_Delete(json_obj);
+
+        osapi_free(decoded_data);
+    }
+     /* Do nothing */
+    else 
+    {
+        mqttd_debug("No valid topic found, doing nothing.");
+    }
+}
+
+#endif
+
+
+
+#if 0
 /* FUNCTION NAME:  _mqttd_subscribe_cb
  * PURPOSE:
  *      MQTTD SUBSCRIBE callback function
@@ -1508,7 +2057,90 @@ static void _mqttd_subscribe_cb(void *arg, err_t err)
         ptr_mqttd->state = MQTTD_STATE_CONNECTED;
     }
 }
+#else
+/* FUNCTION NAME:  _mqttd_subscribe_cb
+ * PURPOSE:
+ *      MQTTD SUBSCRIBE callback function
+ *
+ * INPUT:
+ *      arg     --  The pointer of MQTTD ctrl structure
+ *      err     --  The subscribe process error status
+ *
+ * OUTPUT:
+ *      None
+ *
+ * RETURN:
+ *      None
+ *
+ * NOTES:
+ *      None
+ *
+ */
+static void _mqttd_subscribe_cb(void *arg, err_t err)
+{
+    MQTTD_CTRL_T *ptr_mqttd = (MQTTD_CTRL_T *)arg;
 
+    mqttd_debug("mqtt subscribe error state is (%d)\n", (UI8_T)err);
+
+    if (err == ERR_OK)
+    {
+        /* If SUBACK received, then PUBLISH online event */
+        char topic[128];
+        osapi_snprintf(topic, sizeof(topic), "%s/event", ptr_mqttd->topic_prefix);
+        cJSON *root = cJSON_CreateObject();
+        cJSON *data = cJSON_CreateObject();
+
+        if (root == NULL || data == NULL) {
+            mqttd_debug("Failed to create JSON objects\n");
+            if (root != NULL) cJSON_Delete(root);
+            if (data != NULL) cJSON_Delete(data);
+            return;
+        }
+
+	    cJSON_AddStringToObject(root, "type", "online");
+	    cJSON_AddItemToObject(root, "data", data);
+
+	    cJSON_AddStringToObject(data, "swid", ptr_mqttd->device_id);
+	    cJSON_AddNumberToObject(data, "runtime", 100);
+	    cJSON_AddStringToObject(data, "version", "1.0.0");
+	    cJSON_AddStringToObject(data, "product_name", "G50");
+	    cJSON_AddStringToObject(data, "firmware", "m1-os");
+	    cJSON_AddStringToObject(data, "sn", ptr_mqttd->sn);
+	    cJSON_AddStringToObject(data, "type", "L2");
+	    cJSON_AddStringToObject(data, "mac", ptr_mqttd->mac);
+
+	    char *original_payload = cJSON_PrintUnformatted(root);
+	    cJSON_Delete(root);
+
+	    if (original_payload == NULL) {
+	        printf("Failed to print JSON\n");
+	        return;
+	    }
+
+		int original_payloadlen = strlen(original_payload);
+		unsigned char encoded_payload[512]; // Ensure this is large enough for your payload
+		// Encrypt the payload using RC4
+    	mqttd_rc4_encrypt((unsigned char *)original_payload, original_payloadlen, MQTTD_RC4_KEY, encoded_payload);
+        mqtt_publish(ptr_mqttd->ptr_client, topic, (const void *)encoded_payload, original_payloadlen, MQTTD_REQUEST_QOS, MQTTD_REQUEST_RETAIN, _mqttd_publish_cb, (void *)ptr_mqttd);
+		free(original_payload); // Free the JSON payload
+		
+		osapi_printf("\nMQTT subscribe tx topic done.\n");
+
+		
+		ptr_mqttd->state = MQTTD_STATE_SUBACK;
+		
+		ptr_mqttd->state = MQTTD_STATE_INITING;
+    }
+    else
+    {
+        /* If SUBSCRIBE failed, then try to re-subscribe again */
+        osapi_printf("\n MQTT SUBSCRIBE failed (%d)\n", (UI8_T)err);
+        ptr_mqttd->state = MQTTD_STATE_CONNECTED;
+    }
+}
+#endif
+
+#if 0
 /* FUNCTION NAME:  _mqttd_send_subscribe
  * PURPOSE:
  *      MQTTD send SUBSCRIBE ctrl packet
@@ -1545,7 +2177,42 @@ static void _mqttd_send_subscribe(mqtt_client_t *client, void *arg)
         ptr_mqttd->state = MQTTD_STATE_SUBSCRIBE;
     }
 }
+#else
+/* FUNCTION NAME:  _mqttd_send_subscribe
+ * PURPOSE:
+ *      MQTTD send SUBSCRIBE ctrl packet
+ *
+ * INPUT:
+ *      client  --  The pointer of client handle
+ *      arg     --  The pointer of MQTTD ctrl structure
+ *
+ * OUTPUT:
+ *      None
+ *
+ * RETURN:
+ *      None
+ *
+ * NOTES:
+ *      None
+ *
+ */
+static void _mqttd_send_subscribe(mqtt_client_t *client, void *arg)
+{
+    err_t err;
+    MQTTD_CTRL_T *ptr_mqttd = (MQTTD_CTRL_T *)arg;
+    mqttd_debug("mqtt send subscribe\n");
+    char topic[128];
+    osapi_snprintf(topic, sizeof(topic), "%s/tx", ptr_mqttd->topic_prefix);
 
+    // Send subscribe tx
+    err = mqtt_subscribe(client, topic, MQTTD_REQUEST_QOS, _mqttd_subscribe_cb, arg);
+    if (err == ERR_OK)
+    {
+        ptr_mqttd->state = MQTTD_STATE_SUBSCRIBE;
+    }
+
+}
+#endif
 /* FUNCTION NAME:  _mqttd_connection_cb
  * PURPOSE:
  *      MQTTD connection callback function
@@ -1666,6 +2333,7 @@ static MW_ERROR_NO_T _mqttd_lookup_server(MQTTD_CTRL_T *ptr_mqttd)
 #else
     ip_addr_copy(ptr_mqttd->server_ip, mqttd_server_ip);
 #endif
+	ptr_mqttd->port = MQTT_SRV_PORT;
     if (err == ERR_OK)
     {
         return _mqttd_client_connect(ptr_mqttd);
@@ -1701,9 +2369,9 @@ static MW_ERROR_NO_T _mqttd_client_connect(MQTTD_CTRL_T *ptr_mqttd)
     I8_T err = ERR_OK;
     C8_T username[MQTTD_MAX_CLIENT_ID_SIZE] = MQTTD_USERNAME;
     C8_T password[MQTTD_MAX_CLIENT_ID_SIZE] = MQTTD_PASSWD;
-    C8_T will_topic[MQTTD_MAX_TOPIC_SIZE] = MQTTD_WILL_TOPIC;
+    //C8_T will_topic[MQTTD_MAX_TOPIC_SIZE] = MQTTD_WILL_TOPIC;
     struct mqtt_connect_client_info_t client_info;
-    UI16_T portnum = MQTT_PORT;
+    UI16_T portnum = MQTT_SRV_PORT;
 
     if (ptr_mqttd->ptr_client != NULL)
     {
@@ -1713,32 +2381,17 @@ static MW_ERROR_NO_T _mqttd_client_connect(MQTTD_CTRL_T *ptr_mqttd)
         }
     }
 
-#if MQTTD_SUPPORT_TLS
-    portnum = MQTT_TLS_PORT;
-    const UI8_T* ptr_ca_cert = CA;
-    size_t ca_len = sizeof(CA);
-    tls_config = altcp_tls_create_config_client(ptr_ca_cert, ca_len);
-    if (NULL == tls_config)
-    {
-        osapi_printf("Unable to create TLS config for MQTT, close MQTT!\n");
-        return MW_E_NO_MEMORY;
-    }
-#endif
-
     /* Generate the client information */
     client_info = (struct mqtt_connect_client_info_t){
         (const char *)ptr_mqttd->client_id,  /* Client identifier, must be set by caller */
         username,                 /* User name, set to NULL if not used */
         password,                 /* Password, set to NULL if not used */
         MQTTD_KEEP_ALIVE,         /* keep alive time in seconds, 0 to disable keep alive functionality*/
-        (const char *)will_topic, /* will topic, set to NULL if will is not to be used,
+        (const char *)NULL, /* will topic, set to NULL if will is not to be used,
                                      will_msg, will_qos and will retain are then ignored */
         (const char *)ptr_mqttd->client_id,  /* will_msg, see will_topic */
         MQTTD_WILL_QOS,           /* will_qos, see will_topic */
         MQTTD_WILL_RETAIN         /* will_retain, see will_topic */
-#if MQTTD_SUPPORT_TLS
-        ,tls_config               /* TLS configuration for secure connections */
-#endif
     };
 
     mqttd_debug("MQTTD create a new client (%p) try to connect to %s", ptr_mqttd->ptr_client, ipaddr_ntoa(&ptr_mqttd->server_ip));
@@ -1747,10 +2400,6 @@ static MW_ERROR_NO_T _mqttd_client_connect(MQTTD_CTRL_T *ptr_mqttd)
         ptr_mqttd->ptr_client = mqtt_client_new();
         if (ptr_mqttd->ptr_client == NULL)
         {
-#if MQTTD_SUPPORT_TLS
-            altcp_tls_free_config(tls_config);
-            tls_config = NULL;
-#endif
             osapi_printf("\nconnect_mqtt: create new mqtt client failed.\n");
             return MW_E_NO_MEMORY;
         }
@@ -1764,10 +2413,6 @@ static MW_ERROR_NO_T _mqttd_client_connect(MQTTD_CTRL_T *ptr_mqttd)
         osapi_printf("\nconnect_mqtt: connect to remote mqtt server failed: %d.\n", err);
         if (ERR_MEM == err)
         {
-#if MQTTD_SUPPORT_TLS
-            altcp_tls_free_config(tls_config);
-            tls_config = NULL;
-#endif
             return MW_E_NO_MEMORY;
         }
         else
@@ -1841,7 +2486,7 @@ static void _mqttd_reconnect_tmr(timehandle_t ptr_xTimer)
         }
     }
 }
-
+# if 0
 static void _mqttd_main(void *arg)
 {
     MW_ERROR_NO_T rc = MW_E_NOT_INITED;
@@ -1937,7 +2582,7 @@ static void _mqttd_main(void *arg)
 
     _mqttd_deinit();
 }
-
+#endif
 /* EXPORTED SUBPROGRAM BODIES
  */
 /* FUNCTION NAME: mqttd_init
@@ -2100,6 +2745,7 @@ MW_ERROR_NO_T _mqttd_deinit(void)
     return MW_E_OK;
 }
 
+#if 0
 /* FUNCTION NAME: mqttd_dump_topic
  * PURPOSE:
  *      Dump all mqtt supported topics
@@ -2116,6 +2762,8 @@ MW_ERROR_NO_T _mqttd_deinit(void)
  * NOTES:
  *      For debug using only
  */
+
+
 void mqttd_dump_topic(void)
 {
     C8_T topic[MQTTD_MAX_TOPIC_SIZE] = {0};
@@ -2136,6 +2784,14 @@ void mqttd_dump_topic(void)
         t_idx++;
     }
 }
+
+#else
+void mqttd_dump_topic(void)
+{
+    osapi_printf("\nMQTTD supported DB Topics\n");
+}
+
+#endif
 
 /* FUNCTION NAME: mqttd_debug_enable
  * PURPOSE:
@@ -2289,3 +2945,139 @@ mqttd_get_state(
 {
     return mqttd_enable;
 }
+
+
+static void _mqttd_gen_client_id(MQTTD_CTRL_T *ptr_mqttd)
+{
+    C8_T ident[] = "sw:hongrui:hongrui:2024";
+    C8_T device_str[128] = {0};
+    C8_T device_md5[16] = {0};
+	
+    //C8_T device_md5_str[33] = {0};
+	C8_T manufacturer[] = "hongrui";
+	C8_T device_type[] = "sw";
+	C8_T device_id_str[64] = {0};
+	int i;
+    // Get SN and MAC address
+    // TODO: Implement functions to get actual SN and MAC
+    osapi_strncpy(ptr_mqttd->sn, "C171Z1YM000000", MQTTD_MAX_SN_SIZE-1);
+    osapi_strncpy(ptr_mqttd->mac, "1C:2A:A3:00:00:2F", MQTTD_MAX_MAC_SIZE-1);
+    
+    // Combine SN, MAC and IDENT
+    osapi_snprintf(device_str, sizeof(device_str), "%s%s%s", ptr_mqttd->sn, ptr_mqttd->mac, ident);
+    
+    // Calculate MD5 of combined string
+    md5(device_str, osapi_strlen(device_str), device_md5);
+
+    for (i = 0; i < 16; i++) {
+        osapi_snprintf(&ptr_mqttd->device_id[i * 2], 3, "%02x", (unsigned char)device_md5[i]);
+    }
+    
+    // Copy MD5 result to client_id
+    osapi_snprintf(ptr_mqttd->topic_prefix, MQTTD_MAX_TOPIC_PREFIX_SIZE - 1, "%s/%s/%s", manufacturer, device_type, ptr_mqttd->device_id);
+    osapi_snprintf(ptr_mqttd->client_id, MQTTD_MAX_CLIENT_ID_SIZE - 1, "%s:%s:%s", manufacturer, device_type, ptr_mqttd->device_id);
+    ptr_mqttd->topic_prefix[MQTTD_MAX_TOPIC_PREFIX_SIZE - 1] = '\0';
+	ptr_mqttd->client_id[MQTTD_MAX_CLIENT_ID_SIZE - 1] = '\0';
+    osapi_printf("Client ID: %s\n", ptr_mqttd->client_id);
+	osapi_printf("Topic Prefix: %s\n", ptr_mqttd->topic_prefix);
+    return;
+}
+
+
+static void _mqttd_main(void *arg)
+{
+    MW_ERROR_NO_T rc = MW_E_NOT_INITED;
+    UI8_T netif_num = 0;
+    struct netif *xNetIf = NULL;
+
+    /* Waiting until DB and Netif are ready */
+    do
+    {
+        rc = dbapi_dbisReady();
+    }while(rc != MW_E_OK);
+
+    /* Initialize client ID */
+    (void)_mqttd_gen_client_id(&mqttd);
+
+    do{
+        netif_num = netif_num_get();
+        xNetIf = netif_get_by_index(netif_num);
+        osapi_delay(MQTTD_MUX_LOCK_TIME);
+    } while (xNetIf == NULL);
+
+    mqttd_debug("MQTTD use NetIf num:%d, name:%s, mac:[%02x:%02x:%02x:%02x:%02x:%02x]",
+        xNetIf->num, xNetIf->name,
+        xNetIf->hwaddr[0],
+        xNetIf->hwaddr[1],
+        xNetIf->hwaddr[2],
+        xNetIf->hwaddr[3],
+        xNetIf->hwaddr[4],
+        xNetIf->hwaddr[5]);
+
+    do{
+        /* Connect to MQTT */
+        rc = _mqttd_lookup_server(&mqttd);
+        if (rc == MW_E_NO_MEMORY)
+        {
+            osapi_printf("Failed to connect to mqtt server due to no memory, close mqttd!\n");
+            mqttd.state = MQTTD_STATE_DISCONNECTED;
+            break;
+        }
+        else if (rc != MW_E_OK)
+        {
+            mqttd_debug("Failed to connect to mqtt server.\n");
+            mqttd.reconnect = TRUE;
+            mqttd.state = MQTTD_STATE_DISCONNECTED;
+            break;
+        }
+        else
+        {
+            if(MW_E_OK != osapi_timerStart(ptr_mqttd_time))
+            {
+                osapi_printf("Failed to start MQTTD timer. MQTTD Stopped.\n");
+                mqttd.state = MQTTD_STATE_DISCONNECTED;
+                break;
+            }
+        }
+    }while(0);
+
+    while(mqttd.state < MQTTD_STATE_DISCONNECTED)
+    {
+        switch (mqttd.state)
+        {
+            case MQTTD_STATE_CONNECTED:
+            {
+                // Set publish callback functions
+                _mqttd_send_subscribe(mqttd.ptr_client, (void *)&mqttd);//TO MQTT BROKER
+                break;
+            }
+            case MQTTD_STATE_INITING:
+            {
+                if (MW_E_OK == _mqttd_subscribe_db(&mqttd)) //TO DB PROXY
+                {
+                    if (mqttd.state != MQTTD_STATE_DISCONNECTED)
+                    {
+                        mqttd.state = MQTTD_STATE_RUN;
+                    }
+                }
+                break;
+            }
+            case MQTTD_STATE_RUN:
+            {
+                /* Waiting for DB send notification */
+                _mqttd_listen_db(&mqttd);
+                break;
+            }
+            default:
+            {
+                osapi_delay(MQTTD_MUX_LOCK_TIME);
+                //mqttd_debug("MQTTD process state %d", mqttd.state);
+                break;
+            }
+        }
+    }
+
+    _mqttd_deinit();
+}
+
+

@@ -4,7 +4,7 @@ CGI_DIR = ../html/cgi
 
 SRC = mqttd.c
 SRC += mqttd_queue.c
-
+SRC += hr_cjson.c
 all: $(OBJ)
 %.o:%.c
 ifeq ("$(AIR_LOG)", "")
